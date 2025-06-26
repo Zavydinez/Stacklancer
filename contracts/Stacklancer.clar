@@ -124,3 +124,109 @@
         (ok auction-id)
     )
 )
+
+
+(define-public (place-bid (auction-id uint) (amount uint))
+    (let 
+        (
+            (auction (unwrap! (map-get? auctions auction-id) ERR-NOT-FOUND))
+            (fee (/ (* amount FEE-RATE) u1000))
+            (min-increment (/ (get highest-bid auction) u20)) ;; 5% minimum bid increment
+        )
+        ;; State checks
+        (asserts! (check-auction-active auction-id) ERR-AUCTION-NOT-ACTIVE)
+        (asserts! (< stacks-block-height (get end-height auction)) ERR-AUCTION-EXPIRED)
+        (asserts! (not (is-eq tx-sender (get talent auction))) ERR-SELF-BIDDING)
+
+        ;; Bid validation
+        (asserts! (> amount (+ (get highest-bid auction) min-increment)) ERR-INVALID-BID)
+        (asserts! (<= amount (stx-get-balance tx-sender)) ERR-INSUFFICIENT-FUNDS)
+
+        ;; Handle transfers
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? fee tx-sender CONTRACT-OWNER)))
+
+        ;; Update total fees
+        (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
+
+        ;; Refund previous bidder if exists
+        (match (get highest-bidder auction) prev-bidder
+            (try! (as-contract (stx-transfer? (get highest-bid auction) tx-sender prev-bidder)))
+            true
+        )
+
+        ;; Update auction
+        (ok (map-set auctions auction-id (merge auction {
+            highest-bid: amount,
+            highest-bidder: (some tx-sender)
+        })))
+    )
+)
+
+(define-public (complete-auction (auction-id uint))
+    (let 
+        (
+            (auction (unwrap! (map-get? auctions auction-id) ERR-NOT-FOUND))
+            (talent-data (unwrap! (map-get? talents tx-sender) ERR-NOT-FOUND))
+        )
+        ;; State checks
+        (asserts! (check-auction-active auction-id) ERR-AUCTION-NOT-ACTIVE)
+        (asserts! (>= stacks-block-height (get end-height auction)) ERR-AUCTION-NOT-ENDED)
+        (asserts! (is-eq (get talent auction) tx-sender) ERR-NOT-AUTHORIZED)
+
+        ;; Check if there was a bid
+        (asserts! (is-some (get highest-bidder auction)) ERR-INVALID-STATE)
+
+        ;; Transfer payment to talent
+        (try! (as-contract (stx-transfer? 
+            (get highest-bid auction)
+            tx-sender 
+            (get talent auction)
+        )))
+
+        ;; Update talent stats
+        (map-set talents tx-sender (merge talent-data {
+            total-earnings: (+ (get total-earnings talent-data) (get highest-bid auction)),
+            auctions-completed: (+ (get auctions-completed talent-data) u1)
+        }))
+
+        ;; Update global stats
+        (var-set total-auctions-completed (+ (var-get total-auctions-completed) u1))
+
+        (ok (map-set auctions auction-id (merge auction {
+            status: "completed"
+        })))
+    )
+)
+
+;; Read-only Functions
+(define-read-only (get-auction (auction-id uint))
+    (map-get? auctions auction-id)
+)
+
+(define-read-only (get-talent-info (address principal))
+    (map-get? talents address)
+)
+
+(define-read-only (get-contract-stats)
+    {
+        total-auctions: (var-get total-auctions-completed),
+        total-fees: (var-get total-fees-collected)
+    }
+)
+
+(define-read-only (is-registered (address principal))
+    (is-some (map-get? talents address))
+)
+
+(define-read-only (can-complete-auction (auction-id uint))
+    (match (map-get? auctions auction-id)
+        auction (and 
+            (is-eq (get status auction) "active")
+            (>= stacks-block-height (get end-height auction))
+            (is-some (get highest-bidder auction))
+        )
+        false
+    )
+)
+
